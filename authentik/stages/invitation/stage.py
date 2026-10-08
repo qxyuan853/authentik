@@ -60,6 +60,17 @@ class InvitationStageView(StageView):
                 return self.executor.stage_ok()
             return self.executor.stage_invalid(_("Invalid invite/invite not found"))
 
+        if invite.single_use:
+            # Consume the invitation before it takes effect, and only continue if this
+            # request is the one that actually deleted it. Concurrent requests with the
+            # same link can all look the invitation up before any of them deletes it;
+            # checking the deleted row count makes sure only one of them gets through.
+            deleted = Invitation.objects.filter(pk=invite.pk).delete()[0]
+            if not deleted:
+                self.logger.debug("invitation already used", token=str(invite.invite_uuid))
+                return self.executor.stage_invalid(_("Invalid invite/invite not found"))
+            self.logger.debug("Deleted invitation", token=str(invite.invite_uuid))
+
         self.executor.plan.context[PLAN_CONTEXT_INVITATION_IN_EFFECT] = True
         self.executor.plan.context[PLAN_CONTEXT_INVITATION] = invite
 
@@ -69,7 +80,4 @@ class InvitationStageView(StageView):
         self.executor.plan.context[PLAN_CONTEXT_PROMPT] = context
 
         invitation_used.send(sender=self, request=request, invitation=invite)
-        if invite.single_use:
-            invite.delete()
-            self.logger.debug("Deleted invitation", token=str(invite.invite_uuid))
         return self.executor.stage_ok()

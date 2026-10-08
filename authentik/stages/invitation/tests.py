@@ -11,6 +11,7 @@ from rest_framework.test import APITestCase
 
 from authentik.blueprints.v1.importer import SERIALIZER_CONTEXT_BLUEPRINT
 from authentik.core.tests.utils import create_test_admin_user, create_test_flow
+from authentik.events.models import Event, EventAction
 from authentik.flows.markers import StageMarker
 from authentik.flows.models import FlowDesignation, FlowStageBinding
 from authentik.flows.planner import PLAN_CONTEXT_PENDING_USER, FlowPlan
@@ -181,6 +182,40 @@ class TestInvitationStage(FlowTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertStageRedirects(response, reverse("authentik_core:root-redirect"))
         self.assertFalse(Invitation.objects.filter(pk=invite.pk))
+
+    def test_with_invitation_single_use_already_consumed(self):
+        """Test that a single-use invitation which was consumed after it was looked up
+        (another request using the same link at the same time) is refused"""
+        plan = FlowPlan(flow_pk=self.flow.pk.hex, bindings=[self.binding], markers=[StageMarker()])
+        session = self.client.session
+        session[SESSION_KEY_PLAN] = plan
+        session.save()
+
+        invite = Invitation.objects.create(
+            created_by=get_anonymous_user(), fixed_data={"foo": "bar"}, single_use=True
+        )
+        # The state a concurrent request is in: it has already read the invitation,
+        # but another request has deleted it in the meantime
+        Invitation.objects.filter(pk=invite.pk).delete()
+
+        with patch(
+            "authentik.stages.invitation.stage.InvitationStageView.get_invite",
+            MagicMock(return_value=invite),
+        ):
+            base_url = reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+            args = urlencode({QS_INVITATION_TOKEN_KEY: invite.pk.hex})
+            response = self.client.get(base_url + f"?query={args}")
+
+        self.assertStageResponse(
+            response,
+            flow=self.flow,
+            component="ak-stage-access-denied",
+        )
+        self.assertFalse(
+            Event.objects.filter(
+                action=EventAction.INVITE_USED, context__invitation_uuid=invite.pk.hex
+            ).exists()
+        )
 
 
 class TestInvitationsAPI(APITestCase):
